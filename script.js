@@ -19,6 +19,8 @@ const ITERATIONS = 6;
 const STIFFNESS = 0.78;
 const MAX_SPEED = 32;
 
+const GLINTS = ["#ffffff", "#b6ff6a", "#62fff0", "#6aa4ff", "#ff5cbe", "#ffe56b"];
+
 const canvas = document.querySelector("#curtain");
 const ctx = canvas.getContext("2d");
 const tintLayer = document.createElement("canvas");
@@ -28,9 +30,15 @@ const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matc
 let ropes = [];
 let viewWidth = 0;
 let viewHeight = 0;
+let pixelRatio = 1;
+
 let pointer = null;
 let previousPointer = null;
-let tintHue = null;
+let metal = { h: 214, s: 8, l: 80 };
+let metalFrom = { h: 214, s: 8, l: 80 };
+let metalTo = { h: 214, s: 8, l: 80 };
+let shiftStart = 0;
+let shiftDuration = 0;
 
 function hash(n) {
   const x = Math.sin(n * 127.1) * 43758.5453;
@@ -197,7 +205,7 @@ function simulate() {
   previousPointer = pointer ? { ...pointer } : null;
 }
 
-function drawRope(rope) {
+function drawRope(rope, target) {
   const { points, image, sx, sw, sh, width } = rope;
   const slice = sh / (points.length - 1);
 
@@ -209,10 +217,10 @@ function drawRope(rope) {
     const length = Math.hypot(dx, dy);
     if (length < 0.5) continue;
 
-    ctx.save();
-    ctx.translate((a.x + b.x) / 2, (a.y + b.y) / 2);
-    ctx.rotate(Math.atan2(dy, dx) - Math.PI / 2);
-    ctx.drawImage(
+    target.save();
+    target.translate((a.x + b.x) / 2, (a.y + b.y) / 2);
+    target.rotate(Math.atan2(dy, dx) - Math.PI / 2);
+    target.drawImage(
       image,
       sx,
       slice * i,
@@ -223,12 +231,41 @@ function drawRope(rope) {
       width,
       length + 1
     );
-    ctx.restore();
+    target.restore();
   }
 }
 
-function applyTint() {
-  if (tintHue == null) return;
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function hueLerp(a, b, t) {
+  const delta = ((b - a + 540) % 360) - 180;
+  return (a + delta * t + 360) % 360;
+}
+
+function currentMetal(now) {
+  if (!shiftDuration) return metal;
+  const t = Math.min(1, (now - shiftStart) / shiftDuration);
+  if (t >= 1) {
+    metal = { ...metalTo };
+    shiftDuration = 0;
+    return metal;
+  }
+
+  const ease = 1 - (1 - t) ** 3;
+  return {
+    h: hueLerp(metalFrom.h, metalTo.h, ease),
+    s: lerp(metalFrom.s, metalTo.s, ease),
+    l: lerp(metalFrom.l, metalTo.l, ease),
+  };
+}
+
+function applySilver(now) {
+  const tone = currentMetal(now);
+  const ground = `hsl(${tone.h} ${Math.min(58, tone.s + 12)}% 12%)`;
+  document.documentElement.style.background = ground;
+  document.body.style.background = ground;
 
   const width = tintLayer.width;
   const height = tintLayer.height;
@@ -236,7 +273,7 @@ function applyTint() {
   tintCtx.globalCompositeOperation = "source-over";
   tintCtx.globalAlpha = 1;
   tintCtx.clearRect(0, 0, width, height);
-  tintCtx.fillStyle = `hsl(${tintHue} 100% 50%)`;
+  tintCtx.fillStyle = `hsl(${tone.h} ${tone.s}% ${tone.l}%)`;
   tintCtx.fillRect(0, 0, width, height);
   tintCtx.globalCompositeOperation = "destination-in";
   tintCtx.drawImage(canvas, 0, 0);
@@ -249,23 +286,65 @@ function applyTint() {
   ctx.restore();
 }
 
-function frame() {
+function drawSparkles(rope, now) {
+  const count = 34;
+
+  for (let s = 0; s < count; s += 1) {
+    const seed = rope.anchorX * 0.17 + s * 19.7 + rope.depth * 50;
+    const span = rope.points.length - 1;
+    const index = Math.min(span - 1, Math.floor(hash(seed) * span));
+    const a = rope.points[index];
+    const b = rope.points[index + 1];
+    const along = hash(seed + 3);
+    const across = (hash(seed + 7) - 0.5) * rope.width * 0.7;
+    const x = a.x + (b.x - a.x) * along + across;
+    const y = a.y + (b.y - a.y) * along;
+    const wave = reducedMotion ? 0.7 : Math.sin(now * 0.004 + hash(seed + 11) * 40);
+    const flicker = Math.pow(Math.max(0, wave), 3);
+    if (flicker < 0.05) continue;
+
+    const color = GLINTS[Math.floor(hash(seed + 13) * GLINTS.length)];
+    const size = 0.6 + hash(seed + 17) * 1.3;
+
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.25 + flicker * 0.75;
+    ctx.beginPath();
+    ctx.arc(x, y, size * 2.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    ctx.arc(x, y, size * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (flicker > 0.45) {
+      ctx.globalAlpha = flicker;
+      ctx.fillRect(x - size * 2.2, y - 0.35, size * 4.4, 0.7);
+      ctx.fillRect(x - 0.35, y - size * 2.2, 0.7, size * 4.4);
+    }
+    ctx.restore();
+  }
+}
+
+function frame(now) {
   simulate();
+  ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   ctx.clearRect(0, 0, viewWidth, viewHeight);
-  ropes.forEach(drawRope);
-  applyTint();
+  ropes.forEach((rope) => drawRope(rope, ctx));
+  applySilver(now);
+  ropes.forEach((rope) => drawSparkles(rope, now));
   requestAnimationFrame(frame);
 }
 
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
   viewWidth = window.innerWidth;
   viewHeight = window.innerHeight;
-  canvas.width = Math.round(viewWidth * dpr);
-  canvas.height = Math.round(viewHeight * dpr);
+  canvas.width = Math.round(viewWidth * pixelRatio);
+  canvas.height = Math.round(viewHeight * pixelRatio);
   tintLayer.width = canvas.width;
   tintLayer.height = canvas.height;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 }
 
 window.addEventListener("pointermove", (event) => {
@@ -276,7 +355,20 @@ window.addEventListener("pointermove", (event) => {
 window.addEventListener("pointerdown", (event) => {
   pointer = { x: event.clientX, y: event.clientY };
   previousPointer = { ...pointer };
-  tintHue = Math.random() * 360;
+  const now = performance.now();
+  metalFrom = { ...currentMetal(now) };
+  metalTo = {
+    h: Math.random() * 360,
+    s: 34 + Math.random() * 16,
+    l: 62 + Math.random() * 8,
+  };
+  if (reducedMotion) {
+    metal = { ...metalTo };
+    shiftDuration = 0;
+    return;
+  }
+  shiftStart = now;
+  shiftDuration = 520;
 });
 
 window.addEventListener("pointerleave", () => {
