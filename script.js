@@ -19,12 +19,19 @@ const ITERATIONS = 6;
 const STIFFNESS = 0.78;
 const MAX_SPEED = 32;
 
-const GLINTS = ["#ffffff", "#b6ff6a", "#62fff0", "#6aa4ff", "#ff5cbe", "#ffe56b"];
+const SILVER = { r: 202, g: 204, b: 206 };
+const SHADES = [
+  [224, 179, 166], [205, 125, 140], [197, 118, 124], [202, 126, 132], [210, 141, 151], [196, 142, 163], [224, 178, 162],
+  [144, 66, 80], [120, 54, 67], [128, 69, 92], [125, 66, 92], [131, 71, 99], [122, 51, 87], [205, 131, 149],
+  [109, 41, 70], [115, 50, 66], [138, 84, 107], [141, 84, 105], [139, 77, 89], [99, 34, 59], [114, 51, 78],
+  [126, 110, 66], [144, 129, 88], [160, 149, 107], [164, 153, 109], [163, 152, 109], [131, 115, 71], [124, 108, 64],
+  [218, 183, 150], [145, 98, 78], [142, 103, 89], [164, 121, 101], [206, 156, 129], [207, 154, 120], [225, 189, 175],
+  [238, 214, 190], [242, 222, 204], [236, 209, 197], [230, 197, 188], [228, 193, 185], [209, 169, 188], [188, 157, 147],
+  [246, 228, 211], [245, 222, 206], [242, 217, 196], [239, 212, 190], [235, 210, 196], [189, 137, 146], [188, 140, 162],
+].map(([r, g, b]) => ({ r, g, b }));
 
 const canvas = document.querySelector("#curtain");
 const ctx = canvas.getContext("2d");
-const tintLayer = document.createElement("canvas");
-const tintCtx = tintLayer.getContext("2d");
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 let ropes = [];
@@ -34,11 +41,15 @@ let pixelRatio = 1;
 
 let pointer = null;
 let previousPointer = null;
-let metal = { h: 214, s: 8, l: 80 };
-let metalFrom = { h: 214, s: 8, l: 80 };
-let metalTo = { h: 214, s: 8, l: 80 };
+let metal = { ...SILVER };
+let metalFrom = { ...SILVER };
+let metalTo = { ...SILVER };
 let shiftStart = 0;
 let shiftDuration = 0;
+let paintedKey = "";
+let canReadPixels = true;
+const colorBuffers = new Map();
+const foilReference = new Map();
 
 function hash(n) {
   const x = Math.sin(n * 127.1) * 43758.5453;
@@ -94,6 +105,7 @@ function buildCurtain(images) {
     }
 
     ropes.push({
+      source: image.image,
       image: image.image,
       sx: image.sx,
       sw: image.sw,
@@ -239,9 +251,100 @@ function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
-function hueLerp(a, b, t) {
-  const delta = ((b - a + 540) % 360) - 180;
-  return (a + delta * t + 360) % 360;
+function luminanceAt(data, index) {
+  return data[index] * 0.2126 + data[index + 1] * 0.7152 + data[index + 2] * 0.0722;
+}
+
+function referenceFor(source, data) {
+  const cached = foilReference.get(source);
+  if (cached) return cached;
+
+  const lums = [];
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] < 24) continue;
+    lums.push(luminanceAt(data, i));
+  }
+  lums.sort((a, b) => a - b);
+  const reference = lums[Math.floor(lums.length * 0.7)] || 210;
+  foilReference.set(source, reference);
+  return reference;
+}
+
+function recolorSource(source, color) {
+  let buffer = colorBuffers.get(source);
+  if (!buffer) {
+    buffer = document.createElement("canvas");
+    buffer.width = source.naturalWidth || source.width;
+    buffer.height = source.naturalHeight || source.height;
+    colorBuffers.set(source, buffer);
+  }
+
+  const bufferCtx = buffer.getContext("2d", { willReadFrequently: true });
+  bufferCtx.globalCompositeOperation = "source-over";
+  bufferCtx.globalAlpha = 1;
+  bufferCtx.clearRect(0, 0, buffer.width, buffer.height);
+  bufferCtx.drawImage(source, 0, 0);
+
+  if (canReadPixels) {
+    try {
+      const imageData = bufferCtx.getImageData(0, 0, buffer.width, buffer.height);
+      const data = imageData.data;
+      const reference = referenceFor(source, data);
+      const highlightSpan = Math.max(0.08, 254 / reference - 1);
+
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3] < 8) continue;
+        const gain = luminanceAt(data, i) / reference;
+        if (gain <= 1) {
+          data[i] = color.r * gain;
+          data[i + 1] = color.g * gain;
+          data[i + 2] = color.b * gain;
+        } else {
+          const lift = Math.min(1, (gain - 1) / highlightSpan) * 0.62;
+          data[i] = color.r + (255 - color.r) * lift;
+          data[i + 1] = color.g + (255 - color.g) * lift;
+          data[i + 2] = color.b + (255 - color.b) * lift;
+        }
+      }
+
+      bufferCtx.putImageData(imageData, 0, 0);
+      return buffer;
+    } catch (error) {
+      canReadPixels = false;
+      bufferCtx.globalCompositeOperation = "source-over";
+      bufferCtx.globalAlpha = 1;
+      bufferCtx.clearRect(0, 0, buffer.width, buffer.height);
+      bufferCtx.drawImage(source, 0, 0);
+    }
+  }
+
+  const rgb = `rgb(${Math.round(color.r)} ${Math.round(color.g)} ${Math.round(color.b)})`;
+  bufferCtx.globalCompositeOperation = "screen";
+  bufferCtx.globalAlpha = 0.5;
+  bufferCtx.fillStyle = "#ffffff";
+  bufferCtx.fillRect(0, 0, buffer.width, buffer.height);
+  bufferCtx.globalAlpha = 1;
+  bufferCtx.globalCompositeOperation = "multiply";
+  bufferCtx.fillStyle = rgb;
+  bufferCtx.fillRect(0, 0, buffer.width, buffer.height);
+  bufferCtx.globalCompositeOperation = "destination-in";
+  bufferCtx.drawImage(source, 0, 0);
+  bufferCtx.globalCompositeOperation = "source-over";
+  bufferCtx.globalAlpha = 1;
+  return buffer;
+}
+
+function paintStrands(color) {
+  const painted = new Map();
+
+  ropes.forEach((rope) => {
+    let colored = painted.get(rope.source);
+    if (!colored) {
+      colored = recolorSource(rope.source, color);
+      painted.set(rope.source, colored);
+    }
+    rope.image = colored;
+  });
 }
 
 function currentMetal(now) {
@@ -255,85 +358,49 @@ function currentMetal(now) {
 
   const ease = 1 - (1 - t) ** 3;
   return {
-    h: hueLerp(metalFrom.h, metalTo.h, ease),
-    s: lerp(metalFrom.s, metalTo.s, ease),
-    l: lerp(metalFrom.l, metalTo.l, ease),
+    r: lerp(metalFrom.r, metalTo.r, ease),
+    g: lerp(metalFrom.g, metalTo.g, ease),
+    b: lerp(metalFrom.b, metalTo.b, ease),
   };
 }
 
-function applySilver(now) {
+function applyColor(now) {
   const tone = currentMetal(now);
-  const ground = `hsl(${tone.h} ${Math.min(58, tone.s + 12)}% 12%)`;
+  const key = `${Math.round(tone.r)},${Math.round(tone.g)},${Math.round(tone.b)}`;
+  if (key === paintedKey) return;
+
+  paintStrands(tone);
+  paintedKey = key;
+  const ground = `rgb(${Math.round(tone.r)} ${Math.round(tone.g)} ${Math.round(tone.b)})`;
   document.documentElement.style.background = ground;
   document.body.style.background = ground;
-
-  const width = tintLayer.width;
-  const height = tintLayer.height;
-  tintCtx.setTransform(1, 0, 0, 1, 0, 0);
-  tintCtx.globalCompositeOperation = "source-over";
-  tintCtx.globalAlpha = 1;
-  tintCtx.clearRect(0, 0, width, height);
-  tintCtx.fillStyle = `hsl(${tone.h} ${tone.s}% ${tone.l}%)`;
-  tintCtx.fillRect(0, 0, width, height);
-  tintCtx.globalCompositeOperation = "destination-in";
-  tintCtx.drawImage(canvas, 0, 0);
-  tintCtx.globalCompositeOperation = "source-over";
-
-  ctx.save();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.globalCompositeOperation = "multiply";
-  ctx.drawImage(tintLayer, 0, 0);
-  ctx.restore();
 }
 
-function drawSparkles(rope, now) {
-  const count = 34;
+function pickShade() {
+  let next = SHADES[Math.floor(Math.random() * SHADES.length)];
 
-  for (let s = 0; s < count; s += 1) {
-    const seed = rope.anchorX * 0.17 + s * 19.7 + rope.depth * 50;
-    const span = rope.points.length - 1;
-    const index = Math.min(span - 1, Math.floor(hash(seed) * span));
-    const a = rope.points[index];
-    const b = rope.points[index + 1];
-    const along = hash(seed + 3);
-    const across = (hash(seed + 7) - 0.5) * rope.width * 0.7;
-    const x = a.x + (b.x - a.x) * along + across;
-    const y = a.y + (b.y - a.y) * along;
-    const wave = reducedMotion ? 0.7 : Math.sin(now * 0.004 + hash(seed + 11) * 40);
-    const flicker = Math.pow(Math.max(0, wave), 3);
-    if (flicker < 0.05) continue;
-
-    const color = GLINTS[Math.floor(hash(seed + 13) * GLINTS.length)];
-    const size = 0.6 + hash(seed + 17) * 1.3;
-
-    ctx.save();
-    ctx.fillStyle = color;
-    ctx.globalAlpha = 0.25 + flicker * 0.75;
-    ctx.beginPath();
-    ctx.arc(x, y, size * 2.6, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalAlpha = 0.85;
-    ctx.beginPath();
-    ctx.arc(x, y, size * 0.55, 0, Math.PI * 2);
-    ctx.fill();
-
-    if (flicker > 0.45) {
-      ctx.globalAlpha = flicker;
-      ctx.fillRect(x - size * 2.2, y - 0.35, size * 4.4, 0.7);
-      ctx.fillRect(x - 0.35, y - size * 2.2, 0.7, size * 4.4);
-    }
-    ctx.restore();
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const same =
+      Math.abs(next.r - metal.r) < 2 &&
+      Math.abs(next.g - metal.g) < 2 &&
+      Math.abs(next.b - metal.b) < 2;
+    if (!same) break;
+    next = SHADES[Math.floor(Math.random() * SHADES.length)];
   }
+
+  return { r: next.r, g: next.g, b: next.b };
 }
 
 function frame(now) {
-  simulate();
-  ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-  ctx.clearRect(0, 0, viewWidth, viewHeight);
-  ropes.forEach((rope) => drawRope(rope, ctx));
-  applySilver(now);
-  ropes.forEach((rope) => drawSparkles(rope, now));
-  requestAnimationFrame(frame);
+  try {
+    simulate();
+    ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+    ctx.clearRect(0, 0, viewWidth, viewHeight);
+    applyColor(now);
+    ropes.forEach((rope) => drawRope(rope, ctx));
+  } finally {
+    requestAnimationFrame(frame);
+  }
 }
 
 function resize() {
@@ -342,8 +409,6 @@ function resize() {
   viewHeight = window.innerHeight;
   canvas.width = Math.round(viewWidth * pixelRatio);
   canvas.height = Math.round(viewHeight * pixelRatio);
-  tintLayer.width = canvas.width;
-  tintLayer.height = canvas.height;
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 }
 
@@ -357,11 +422,7 @@ window.addEventListener("pointerdown", (event) => {
   previousPointer = { ...pointer };
   const now = performance.now();
   metalFrom = { ...currentMetal(now) };
-  metalTo = {
-    h: Math.random() * 360,
-    s: 34 + Math.random() * 16,
-    l: 62 + Math.random() * 8,
-  };
+  metalTo = pickShade();
   if (reducedMotion) {
     metal = { ...metalTo };
     shiftDuration = 0;
@@ -378,7 +439,10 @@ window.addEventListener("pointerleave", () => {
 
 window.addEventListener("resize", () => {
   resize();
-  if (window.tinselImages) buildCurtain(window.tinselImages);
+  if (window.tinselImages) {
+    buildCurtain(window.tinselImages);
+    paintedKey = "";
+  }
 });
 
 resize();
